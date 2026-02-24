@@ -72,11 +72,18 @@ class BhyveClient:
     WS_URL   = "wss://api.orbitbhyve.com/v1/events"
     APP_ID   = "dad3e38c-9af4-4960-aa76-9e51e8ba5c2c"
     TIMEOUT  = 15
+    WS_RECONNECT_DELAY = 15   # seconds between reconnect attempts
 
     def __init__(self, config: Config):
-        self.config = config
-        self._token = None
-        self._lock  = threading.Lock()
+        self.config     = config
+        self._token     = None
+        self._lock      = threading.Lock()
+        # Persistent WebSocket state
+        self._wsa       = None   # WebSocketApp instance
+        self._ws_sock   = None   # live ws socket (set in on_open)
+        self._ws_ready  = threading.Event()   # set when authed and ready
+        self._run_event = threading.Event()   # set when run response arrives
+        self._run_result = None              # most recent run-relevant message
 
     # ── REST helpers ──────────────────────────────────────────────────────────
 
@@ -101,7 +108,7 @@ class BhyveClient:
         except urllib.error.URLError as exc:
             raise APIError(f"Network error {method} {path}: {exc.reason}") from exc
 
-    # ── public methods ────────────────────────────────────────────────────────
+    # ── REST auth ─────────────────────────────────────────────────────────────
 
     def login(self):
         """Authenticate via REST and cache the session token."""
@@ -112,7 +119,6 @@ class BhyveClient:
                 "password": self.config.bhyve_password,
             }
         })
-        # API returns "orbit_api_key" (not "orbit_session_token" as some docs suggest)
         token = resp.get("orbit_api_key") or resp.get("orbit_session_token")
         if not token:
             raise APIError(f"No API key in login response: {resp}")
@@ -120,116 +126,142 @@ class BhyveClient:
             self._token = token
         log.info("bhyve login successful (user_id=%s)", resp.get("user_id", "?"))
 
-    def _ensure_logged_in(self):
+    # ── Persistent WebSocket ──────────────────────────────────────────────────
+
+    def connect_ws(self):
+        """Open a persistent WebSocket connection in a background thread."""
         with self._lock:
-            needs_login = not self._token
-        if needs_login:
-            self.login()
+            token = self._token
+        if not token:
+            raise APIError("Must login before connecting WebSocket")
+
+        self._ws_ready.clear()
+
+        self._wsa = websocket.WebSocketApp(
+            self.WS_URL,
+            on_open    = self._on_ws_open,
+            on_message = self._on_ws_message,
+            on_error   = self._on_ws_error,
+            on_close   = self._on_ws_close,
+        )
+        t = threading.Thread(
+            target=self._wsa.run_forever,
+            kwargs={"ping_interval": 25, "ping_timeout": 10},
+            daemon=True,
+        )
+        t.start()
+        log.debug("WS thread started, waiting for connection…")
+        if not self._ws_ready.wait(timeout=30):
+            raise APIError("WebSocket did not connect within 30s")
+        log.info("bhyve WebSocket connected and ready")
+
+    def _on_ws_open(self, ws):
+        self._ws_sock = ws
+        with self._lock:
+            token = self._token
+        log.debug("WS connected, sending auth")
+        ws.send(json.dumps({
+            "event":         "app_connection",
+            "orbit_app_id":  self.APP_ID,
+            "orbit_api_key": token,
+        }))
+        # Mark ready immediately on open — server may not echo change_mode if rate-limited
+        # Commands can still be sent on an open connection
+        self._ws_ready.set()
+
+    def _on_ws_message(self, ws, raw):
+        if not raw:
+            return
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+        event = msg.get("event", "")
+        log.debug("WS ← %s | %s", event, json.dumps(msg)[:200])
+
+        if event == "change_mode":
+            log.info("bhyve WebSocket authenticated (change_mode received)")
+            return
+
+        if event in ("watering_in_progress", "rain_delay", "set_manual_preset_runtime"):
+            self._run_result = msg
+            self._run_event.set()
+
+    def _on_ws_error(self, ws, error):
+        log.warning("WS error: %s", error)
+
+    def _on_ws_close(self, ws, code, msg):
+        log.warning("WS closed (code=%s) — reconnecting in %ds", code, self.WS_RECONNECT_DELAY)
+        self._ws_ready.clear()
+        self._ws_sock = None
+        # Re-login and reconnect after a delay
+        def _reconnect():
+            time.sleep(self.WS_RECONNECT_DELAY)
+            try:
+                self.login()
+                self.connect_ws()
+            except Exception as exc:
+                log.error("WS reconnect failed: %s — will retry on next zone activation", exc)
+        threading.Thread(target=_reconnect, daemon=True).start()
+
+    # ── Zone control ──────────────────────────────────────────────────────────
 
     def start_zone(self, zone: int, run_time: int):
         """
-        Manually run a single zone via the bhyve WebSocket API.
+        Send a manual-run command via the persistent WebSocket.
 
-        Flow:
-          1. Connect to wss://api.orbitbhyve.com/v1/events
-          2. Send app_connection (auth)
-          3. Send set_rain_delay delay=0  (clear any active rain/freeze delay)
-          4. Send set_manual_preset_runtime for the requested zone
-          5. Confirm watering_in_progress event, then close
-
-        :param zone:     Station/zone number (1-based)
+        :param zone:     Station number (1-based)
         :param run_time: Duration in minutes
         """
-        self._ensure_logged_in()
+        if not self._ws_ready.is_set() or not self._ws_sock:
+            raise APIError("bhyve WebSocket not ready — check logs for connection errors")
+
         device_id = self.config.bhyve_device_id
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        with self._lock:
-            token = self._token
+        # Attempt to clear weather delay before running
+        self._ws_sock.send(json.dumps({
+            "event":     "skip_active_weather_delay",
+            "device_id": device_id,
+            "timestamp": ts,
+        }))
+        self._ws_sock.send(json.dumps({
+            "event":     "set_rain_delay",
+            "device_id": device_id,
+            "delay":     0,
+            "timestamp": ts,
+        }))
+        log.debug("WS → rain-delay clear sent")
 
-        log.info("Connecting to bhyve WebSocket to run zone %d for %d min", zone, run_time)
+        # Send run command
+        self._run_event.clear()
+        self._run_result = None
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        self._ws_sock.send(json.dumps({
+            "event":     "set_manual_preset_runtime",
+            "device_id": device_id,
+            "stations":  [{"station": zone, "run_time": run_time}],
+            "timestamp": ts,
+        }))
+        log.debug("WS → manual run command sent (zone=%d, run_time=%d)", zone, run_time)
 
-        try:
-            ws = websocket.create_connection(self.WS_URL, timeout=20)
-        except Exception as exc:
-            raise APIError(f"WebSocket connect failed: {exc}") from exc
-
-        try:
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-            # 1. Authenticate
-            ws.send(json.dumps({
-                "event":        "app_connection",
-                "orbit_app_id": self.APP_ID,
-                "orbit_api_key": token,
-            }))
-            auth_resp = self._ws_recv(ws, "app_connection")
-            log.debug("WS auth response: %s", auth_resp)
-
-            # 2. Clear any rain / freeze delay
-            ws.send(json.dumps({
-                "event":     "set_rain_delay",
-                "device_id": device_id,
-                "delay":     0,
-                "timestamp": ts,
-            }))
-            log.debug("WS rain-delay clear sent")
-
-            # 3. Send manual run command
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            ws.send(json.dumps({
-                "event":     "set_manual_preset_runtime",
-                "device_id": device_id,
-                "stations":  [{"station": zone, "run_time": run_time}],
-                "timestamp": ts,
-            }))
-            log.debug("WS manual run command sent")
-
-            # 4. Read responses — look for confirmation or rain_delay block
-            for _ in range(8):
-                msg = self._ws_recv(ws, timeout=10)
-                if not msg:
-                    break
-                event = msg.get("event", "")
-                log.debug("WS event: %s | %s", event, json.dumps(msg)[:200])
-
-                if event == "watering_in_progress":
-                    log.info("WS confirmed: zone %d is watering", zone)
-                    break
-                if event == "rain_delay":
-                    delay_h = msg.get("delay", "?")
-                    cause   = msg.get("rain_delay_weather_type", "unknown")
-                    log.warning("bhyve rain delay active: %sh (%s) — zone may not run", delay_h, cause)
-                    # Not raising — command was still sent; device decides
-                    break
-                if event in ("set_manual_preset_runtime", "change_mode"):
-                    log.info("WS run command acknowledged (event=%s)", event)
-                    break
-        finally:
-            try:
-                ws.close()
-            except Exception:
-                pass
-
-    def _ws_recv(self, ws, expected_event: str = None, timeout: int = 15):
-        """Read one non-empty WebSocket message, optionally waiting for a specific event."""
-        ws.settimeout(timeout)
-        for _ in range(10):
-            try:
-                raw = ws.recv()
-            except websocket.WebSocketTimeoutException:
-                return None
-            except Exception as exc:
-                raise APIError(f"WebSocket recv error: {exc}") from exc
-
-            if not raw:
-                continue  # skip empty frames (ping/pong)
-
-            msg = json.loads(raw)
-            if expected_event is None or msg.get("event") == expected_event:
-                return msg
-            # Not the event we want — keep reading
-            log.debug("WS skipping event: %s", msg.get("event"))
-        return None
+        # Wait up to 20s for device confirmation
+        if self._run_event.wait(timeout=20):
+            result = self._run_result
+            event  = result.get("event", "") if result else ""
+            if event == "watering_in_progress":
+                log.info("WS confirmed: zone %d watering", zone)
+            elif event == "rain_delay":
+                delay_h = result.get("delay", "?")
+                cause   = result.get("rain_delay_weather_type", "unknown")
+                raise APIError(
+                    f"Blocked by bhyve rain/freeze delay ({delay_h}h, {cause}). "
+                    f"Open the bhyve app and tap Skip Weather Delay, then retry."
+                )
+            else:
+                log.info("WS run acknowledged (event=%s)", event)
+        else:
+            log.warning("WS: no confirmation within 20s — command was sent but outcome unknown")
 
 
 # ─── Sprinkler Controller ─────────────────────────────────────────────────────
@@ -657,7 +689,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         else:
             # Pull the most recent activity log entry for a useful error message
             with self.controller._lock:
-                last = self.controller.activity_log[0][1] if self.controller.activity_log else "Unknown error"
+                entry = self.controller.activity_log[0] if self.controller.activity_log else None
+                last = entry[2] if entry and len(entry) == 3 else "Unknown error"
             self._json(500, {"activated": False, "error": last})
 
 
@@ -680,11 +713,12 @@ def main():
     client     = BhyveClient(config)
     controller = SprinklerController(config, client)
 
-    # Validate credentials at startup
+    # Login and open persistent WebSocket at startup
     try:
         client.login()
+        client.connect_ws()
     except APIError as exc:
-        log.error("bhyve login failed: %s", exc)
+        log.error("bhyve startup failed: %s", exc)
         sys.exit(1)
 
     WebhookHandler.controller = controller
