@@ -68,9 +68,11 @@ class BhyveClient:
     TIMEOUT  = 15
 
     def __init__(self, config: Config):
-        self.config  = config
-        self._token  = None
-        self._lock   = threading.Lock()
+        self.config       = config
+        self._token       = None
+        self._mac_address = None   # fetched once after login
+        self._device_type = None   # fetched once after login
+        self._lock        = threading.Lock()
 
     # ── internal helpers ──────────────────────────────────────────────────────
 
@@ -113,6 +115,19 @@ class BhyveClient:
         with self._lock:
             self._token = token
         log.info("bhyve login successful (user_id=%s)", resp.get("user_id", "?"))
+        self._fetch_device_info()
+
+    def _fetch_device_info(self):
+        """Cache the device mac_address and type — required fields for the run command."""
+        device_id = self.config.bhyve_device_id
+        try:
+            resp = self._request("GET", f"/devices/{device_id}", auth=True)
+            with self._lock:
+                self._mac_address = resp.get("mac_address")
+                self._device_type = resp.get("type", "sprinkler_timer")
+            log.debug("Device info: type=%s mac=%s", self._device_type, self._mac_address)
+        except APIError as exc:
+            log.warning("Could not fetch device info: %s", exc)
 
     def _ensure_logged_in(self):
         with self._lock:
@@ -131,25 +146,31 @@ class BhyveClient:
         device_id = self.config.bhyve_device_id
         log.info("Starting zone %d on device %s for %d min", zone, device_id, run_time)
 
+        with self._lock:
+            mac  = self._mac_address
+            dtype = self._device_type or "sprinkler_timer"
+
         payload = {
             "device": {
+                "type":                  dtype,
+                "mac_address":           mac,
                 "manual_preset_runtime": run_time,
-                "zones": [{"station": zone, "run_time": run_time}],
+                "zones":                 [{"station": zone, "run_time": run_time}],
             }
         }
 
         try:
-            resp = self._request("PATCH", f"/devices/{device_id}", payload, auth=True)
-            log.debug("start_zone response: %s", resp)
+            resp = self._request("PUT", f"/devices/{device_id}", payload, auth=True)
+            log.debug("start_zone response: %s", str(resp)[:200])
             return resp
         except APIError as exc:
             # Token may have expired — re-login once and retry
             log.warning("Zone start failed (%s); re-logging in and retrying", exc)
             with self._lock:
                 self._token = None
-            self.login()
-            resp = self._request("PATCH", f"/devices/{device_id}", payload, auth=True)
-            log.debug("start_zone retry response: %s", resp)
+            self.login()   # also re-fetches device info
+            resp = self._request("PUT", f"/devices/{device_id}", payload, auth=True)
+            log.debug("start_zone retry response: %s", str(resp)[:200])
             return resp
 
 
@@ -168,13 +189,13 @@ class SprinklerController:
         self.last_triggered = None
         self.activity_log = []       # [(timestamp_str, message), ...]
 
-    def _add_activity(self, message: str):
+    def _add_activity(self, message: str, level: str = "info"):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._lock:
-            self.activity_log.insert(0, (ts, message))
+            self.activity_log.insert(0, (ts, level, message))
             if len(self.activity_log) > self.MAX_LOG:
                 self.activity_log = self.activity_log[:self.MAX_LOG]
-        log.info(message)
+        getattr(log, level, log.info)(message)
 
     def activate_zone(self, zone: int = None, run_time: int = None):
         """Activate a zone (uses config defaults if not specified)."""
@@ -209,7 +230,7 @@ class SprinklerController:
         except APIError as exc:
             with self._lock:
                 self.status = "error"
-            self._add_activity(f"Error activating zone {zone}: {exc}")
+            self._add_activity(f"Error activating zone {zone}: {exc}", level="error")
             return False
 
     def get_state(self) -> dict:
@@ -297,8 +318,10 @@ _STATUS_HTML = """\
       border-bottom: 1px solid #1e293b; font-size: 0.82rem;
     }}
     .log-list li:last-child {{ border-bottom: none; }}
-    .log-ts  {{ color: #475569; white-space: nowrap; flex-shrink: 0; }}
-    .log-msg {{ color: #cbd5e1; }}
+    .log-ts    {{ color: #475569; white-space: nowrap; flex-shrink: 0; }}
+    .log-msg   {{ color: #cbd5e1; }}
+    .log-error {{ color: #f87171; }}
+    .log-warning {{ color: #fb923c; }}
     .empty   {{ color: #475569; font-size: 0.85rem; font-style: italic; }}
   </style>
 </head>
@@ -485,11 +508,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         logs = self.controller.activity_log
         if logs:
-            items = "\n      ".join(
-                f'<li><span class="log-ts">{ts}</span>'
-                f'<span class="log-msg">{msg}</span></li>'
-                for ts, msg in logs
-            )
+            rows = []
+            for entry in logs:
+                ts, level, msg = entry if len(entry) == 3 else (entry[0], "info", entry[1])
+                css = "log-error" if level == "error" else ("log-warning" if level == "warning" else "log-msg")
+                rows.append(
+                    f'<li><span class="log-ts">{ts}</span>'
+                    f'<span class="{css}">{msg}</span></li>'
+                )
+            items = "\n      ".join(rows)
         else:
             items = '<li><span class="empty">No activity yet</span></li>'
 
@@ -565,12 +592,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         log.info("Test activation requested: zone=%d, run_time=%d min", zone, run_time)
-        threading.Thread(
-            target=self.controller.activate_zone,
-            kwargs={"zone": zone, "run_time": run_time},
-            daemon=True,
-        ).start()
-        self._json(200, {"activated": True, "zone": zone, "run_time": run_time})
+        # Run synchronously so the response reflects actual success or failure
+        ok = self.controller.activate_zone(zone=zone, run_time=run_time)
+        if ok:
+            self._json(200, {"activated": True, "zone": zone, "run_time": run_time})
+        else:
+            # Pull the most recent activity log entry for a useful error message
+            with self.controller._lock:
+                last = self.controller.activity_log[0][1] if self.controller.activity_log else "Unknown error"
+            self._json(500, {"activated": False, "error": last})
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
