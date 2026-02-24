@@ -47,17 +47,17 @@ Edit `.env` with your credentials (see [Configuration](#configuration)).
 You need your bhyve device ID before starting. Use your account credentials to query the API:
 
 ```bash
-# Step 1 — get a session token
+# Step 1 — get a session token  (field is "orbit_api_key" in the response)
 TOKEN=$(curl -s -X POST https://api.orbitbhyve.com/v1/session \
   -H "Content-Type: application/json" \
   -d '{"session":{"email":"you@example.com","password":"yourpass"}}' \
-  | jq -r '.orbit_session_token')
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['orbit_api_key'])")
 
 # Step 2 — list devices and their IDs
 curl -s https://api.orbitbhyve.com/v1/devices \
   -H "orbit-api-key: $TOKEN" \
   -H "orbit-app-id: dad3e38c-9af4-4960-aa76-9e51e8ba5c2c" \
-  | jq '.[] | {id, name}'
+  | python3 -c "import sys,json; [print(d['id'], d.get('name')) for d in json.load(sys.stdin)]"
 ```
 
 Copy the ID into `BHYVE_DEVICE_ID` in your `.env`.

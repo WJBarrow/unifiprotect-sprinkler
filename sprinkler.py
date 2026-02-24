@@ -106,9 +106,10 @@ class BhyveClient:
                 "password": self.config.bhyve_password,
             }
         })
-        token = resp.get("orbit_session_token")
+        # API returns "orbit_api_key" (not "orbit_session_token" as some docs suggest)
+        token = resp.get("orbit_api_key") or resp.get("orbit_session_token")
         if not token:
-            raise APIError(f"No session token in login response: {resp}")
+            raise APIError(f"No API key in login response: {resp}")
         with self._lock:
             self._token = token
         log.info("bhyve login successful (user_id=%s)", resp.get("user_id", "?"))
