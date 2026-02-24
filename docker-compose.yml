@@ -1,0 +1,8 @@
+services:
+  sprinkler:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8383:8383"
+    env_file:
+      - .env
