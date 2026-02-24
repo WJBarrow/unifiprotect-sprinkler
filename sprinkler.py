@@ -182,14 +182,15 @@ class BhyveClient:
             def _send_run():
                 if not auth_done.wait(timeout=10):
                     log.debug("WS: no change_mode within 10s, sending run anyway")
-                ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 ws.send(json.dumps({
-                    "event":     "set_manual_preset_runtime",
+                    "event":     "change_mode",
+                    "mode":      "manual",
                     "device_id": device_id,
-                    "stations":  [{"station": zone, "run_time": run_time}],
                     "timestamp": ts,
+                    "stations":  [{"station": zone, "run_time": run_time}],
                 }))
-                log.debug("WS → run command sent (zone=%d, run_time=%d)", zone, run_time)
+                log.debug("WS → manual run sent (zone=%d, run_time=%d)", zone, run_time)
             threading.Thread(target=_send_run, daemon=True).start()
 
         def on_message(ws, raw):
