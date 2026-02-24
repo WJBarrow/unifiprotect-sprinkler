@@ -72,7 +72,7 @@ class BhyveClient:
     WS_URL   = "wss://api.orbitbhyve.com/v1/events"
     APP_ID   = "dad3e38c-9af4-4960-aa76-9e51e8ba5c2c"
     TIMEOUT  = 15
-    WS_RECONNECT_DELAY = 15   # seconds between reconnect attempts
+    WS_RECONNECT_DELAY = 120  # seconds between reconnect attempts (avoid rate limiting)
 
     def __init__(self, config: Config):
         self.config     = config
@@ -161,9 +161,10 @@ class BhyveClient:
             token = self._token
         log.debug("WS connected, sending auth")
         ws.send(json.dumps({
-            "event":         "app_connection",
-            "orbit_app_id":  self.APP_ID,
-            "orbit_api_key": token,
+            "event":            "app_connection",
+            "orbit_app_id":     self.APP_ID,
+            "orbit_api_key":    token,
+            "orbit_session_id": token,   # some firmware expects this field name
         }))
         # Mark ready immediately on open — server may not echo change_mode if rate-limited
         # Commands can still be sent on an open connection
@@ -217,21 +218,6 @@ class BhyveClient:
             raise APIError("bhyve WebSocket not ready — check logs for connection errors")
 
         device_id = self.config.bhyve_device_id
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-        # Attempt to clear weather delay before running
-        self._ws_sock.send(json.dumps({
-            "event":     "skip_active_weather_delay",
-            "device_id": device_id,
-            "timestamp": ts,
-        }))
-        self._ws_sock.send(json.dumps({
-            "event":     "set_rain_delay",
-            "device_id": device_id,
-            "delay":     0,
-            "timestamp": ts,
-        }))
-        log.debug("WS → rain-delay clear sent")
 
         # Send run command
         self._run_event.clear()
