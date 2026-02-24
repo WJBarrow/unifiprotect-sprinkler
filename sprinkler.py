@@ -6,14 +6,17 @@ Listens for a Unifi Protect webhook notification and activates a configured
 zone on an Orbit bhyve smart water timer.
 
 bhyve API reference (community-documented):
-  Base URL : https://api.orbitbhyve.com/v1
-  App ID   : dad3e38c-9af4-4960-aa76-9e51e8ba5c2c
-  Login    : POST /session  {"session":{"email":"...","password":"..."}}
-             → {"orbit_session_token":"...", "user_id":"..."}
-  Run zone : PATCH /devices/{device_id}
-             Headers: orbit-api-key: <token>, orbit-app-id: <app_id>
-             Body: {"device":{"manual_preset_runtime":<min>,
-                              "zones":[{"station":<n>,"run_time":<min>}]}}
+  Base URL  : https://api.orbitbhyve.com/v1
+  App ID    : dad3e38c-9af4-4960-aa76-9e51e8ba5c2c
+  Login     : POST /session  {"session":{"email":"...","password":"..."}}
+              → {"orbit_api_key":"...", "user_id":"..."}
+  Devices   : GET  /devices  → [{id, name, type, num_stations, zones, status}]
+  Run zone  : WebSocket wss://api.orbitbhyve.com/v1/events
+              1. send {"event":"app_connection","orbit_app_id":"...","orbit_api_key":"..."}
+              2. send {"event":"set_rain_delay","device_id":"...","delay":0,"timestamp":"..."}
+              3. send {"event":"set_manual_preset_runtime","device_id":"...",
+                       "stations":[{"station":<n>,"run_time":<min>}],"timestamp":"..."}
+  Dep       : websocket-client (pip)
 """
 
 import json
@@ -25,8 +28,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import websocket  # websocket-client package
 
 log = logging.getLogger("sprinkler")
 
@@ -64,17 +69,16 @@ class APIError(Exception):
 
 class BhyveClient:
     BASE_URL = "https://api.orbitbhyve.com/v1"
+    WS_URL   = "wss://api.orbitbhyve.com/v1/events"
     APP_ID   = "dad3e38c-9af4-4960-aa76-9e51e8ba5c2c"
     TIMEOUT  = 15
 
     def __init__(self, config: Config):
-        self.config       = config
-        self._token       = None
-        self._mac_address = None   # fetched once after login
-        self._device_type = None   # fetched once after login
-        self._lock        = threading.Lock()
+        self.config = config
+        self._token = None
+        self._lock  = threading.Lock()
 
-    # ── internal helpers ──────────────────────────────────────────────────────
+    # ── REST helpers ──────────────────────────────────────────────────────────
 
     def _request(self, method: str, path: str, body=None, *, auth: bool = False):
         url  = f"{self.BASE_URL}{path}"
@@ -100,7 +104,7 @@ class BhyveClient:
     # ── public methods ────────────────────────────────────────────────────────
 
     def login(self):
-        """Authenticate and cache the session token."""
+        """Authenticate via REST and cache the session token."""
         log.debug("Logging in to bhyve as %s", self.config.bhyve_email)
         resp = self._request("POST", "/session", {
             "session": {
@@ -115,19 +119,6 @@ class BhyveClient:
         with self._lock:
             self._token = token
         log.info("bhyve login successful (user_id=%s)", resp.get("user_id", "?"))
-        self._fetch_device_info()
-
-    def _fetch_device_info(self):
-        """Cache the device mac_address and type — required fields for the run command."""
-        device_id = self.config.bhyve_device_id
-        try:
-            resp = self._request("GET", f"/devices/{device_id}", auth=True)
-            with self._lock:
-                self._mac_address = resp.get("mac_address")
-                self._device_type = resp.get("type", "sprinkler_timer")
-            log.debug("Device info: type=%s mac=%s", self._device_type, self._mac_address)
-        except APIError as exc:
-            log.warning("Could not fetch device info: %s", exc)
 
     def _ensure_logged_in(self):
         with self._lock:
@@ -137,41 +128,108 @@ class BhyveClient:
 
     def start_zone(self, zone: int, run_time: int):
         """
-        Manually run a single zone.
+        Manually run a single zone via the bhyve WebSocket API.
+
+        Flow:
+          1. Connect to wss://api.orbitbhyve.com/v1/events
+          2. Send app_connection (auth)
+          3. Send set_rain_delay delay=0  (clear any active rain/freeze delay)
+          4. Send set_manual_preset_runtime for the requested zone
+          5. Confirm watering_in_progress event, then close
 
         :param zone:     Station/zone number (1-based)
         :param run_time: Duration in minutes
         """
         self._ensure_logged_in()
         device_id = self.config.bhyve_device_id
-        log.info("Starting zone %d on device %s for %d min", zone, device_id, run_time)
 
         with self._lock:
-            mac  = self._mac_address
-            dtype = self._device_type or "sprinkler_timer"
+            token = self._token
 
-        payload = {
-            "device": {
-                "type":                  dtype,
-                "mac_address":           mac,
-                "manual_preset_runtime": run_time,
-                "zones":                 [{"station": zone, "run_time": run_time}],
-            }
-        }
+        log.info("Connecting to bhyve WebSocket to run zone %d for %d min", zone, run_time)
 
         try:
-            resp = self._request("PUT", f"/devices/{device_id}", payload, auth=True)
-            log.debug("start_zone response: %s", str(resp)[:200])
-            return resp
-        except APIError as exc:
-            # Token may have expired — re-login once and retry
-            log.warning("Zone start failed (%s); re-logging in and retrying", exc)
-            with self._lock:
-                self._token = None
-            self.login()   # also re-fetches device info
-            resp = self._request("PUT", f"/devices/{device_id}", payload, auth=True)
-            log.debug("start_zone retry response: %s", str(resp)[:200])
-            return resp
+            ws = websocket.create_connection(self.WS_URL, timeout=20)
+        except Exception as exc:
+            raise APIError(f"WebSocket connect failed: {exc}") from exc
+
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+            # 1. Authenticate
+            ws.send(json.dumps({
+                "event":        "app_connection",
+                "orbit_app_id": self.APP_ID,
+                "orbit_api_key": token,
+            }))
+            auth_resp = self._ws_recv(ws, "app_connection")
+            log.debug("WS auth response: %s", auth_resp)
+
+            # 2. Clear any rain / freeze delay
+            ws.send(json.dumps({
+                "event":     "set_rain_delay",
+                "device_id": device_id,
+                "delay":     0,
+                "timestamp": ts,
+            }))
+            log.debug("WS rain-delay clear sent")
+
+            # 3. Send manual run command
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            ws.send(json.dumps({
+                "event":     "set_manual_preset_runtime",
+                "device_id": device_id,
+                "stations":  [{"station": zone, "run_time": run_time}],
+                "timestamp": ts,
+            }))
+            log.debug("WS manual run command sent")
+
+            # 4. Read responses — look for confirmation or rain_delay block
+            for _ in range(8):
+                msg = self._ws_recv(ws, timeout=10)
+                if not msg:
+                    break
+                event = msg.get("event", "")
+                log.debug("WS event: %s | %s", event, json.dumps(msg)[:200])
+
+                if event == "watering_in_progress":
+                    log.info("WS confirmed: zone %d is watering", zone)
+                    break
+                if event == "rain_delay":
+                    delay_h = msg.get("delay", "?")
+                    cause   = msg.get("rain_delay_weather_type", "unknown")
+                    log.warning("bhyve rain delay active: %sh (%s) — zone may not run", delay_h, cause)
+                    # Not raising — command was still sent; device decides
+                    break
+                if event in ("set_manual_preset_runtime", "change_mode"):
+                    log.info("WS run command acknowledged (event=%s)", event)
+                    break
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _ws_recv(self, ws, expected_event: str = None, timeout: int = 15):
+        """Read one non-empty WebSocket message, optionally waiting for a specific event."""
+        ws.settimeout(timeout)
+        for _ in range(10):
+            try:
+                raw = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                return None
+            except Exception as exc:
+                raise APIError(f"WebSocket recv error: {exc}") from exc
+
+            if not raw:
+                continue  # skip empty frames (ping/pong)
+
+            msg = json.loads(raw)
+            if expected_event is None or msg.get("event") == expected_event:
+                return msg
+            # Not the event we want — keep reading
+            log.debug("WS skipping event: %s", msg.get("event"))
+        return None
 
 
 # ─── Sprinkler Controller ─────────────────────────────────────────────────────
