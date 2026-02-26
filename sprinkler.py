@@ -207,7 +207,7 @@ class BhyveClient:
             if event == "change_mode":
                 log.debug("WS authenticated (change_mode received)")
                 auth_done.set()
-            elif event in ("watering_in_progress", "rain_delay"):
+            elif event in ("watering_in_progress", "watering_in_progress_notification", "rain_delay"):
                 outcome["event"] = event
                 outcome["msg"]   = msg
                 done.set()
@@ -243,7 +243,7 @@ class BhyveClient:
                 f"Blocked by bhyve rain/freeze delay ({delay_h}h, {cause}). "
                 f"Open the bhyve app and tap Skip Weather Delay, then retry."
             )
-        elif event == "watering_in_progress":
+        elif event in ("watering_in_progress", "watering_in_progress_notification"):
             log.info("WS confirmed: zone %d watering", zone)
         else:
             log.warning("WS closed without confirmation — command may have been processed")
