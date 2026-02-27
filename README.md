@@ -11,11 +11,11 @@ Runs as a single Docker container with no external Python dependencies (stdlib o
 ```
 Unifi Protect Camera
        │
-       │  POST /webhook  {"alarm":{"triggers":[{"key":"animal"}]}}
+       │  POST /webhook  (JSON payload)
        ▼
  sprinkler container (port 8383)
        │
-       │  PATCH /v1/devices/{id}   {"device":{"zones":[{"station":1,"run_time":5}]}}
+       │  WebSocket  change_mode/manual
        ▼
  Orbit bhyve Cloud API
        │
@@ -25,7 +25,7 @@ Unifi Protect Camera
 
 1. Unifi Protect fires a webhook on a smart detection event.
 2. The app checks the payload for a matching trigger key (`animal`, `person`, `vehicle`, etc.).
-3. On match it authenticates with the bhyve cloud API and sends a manual-run command for the configured zone.
+3. On match it connects to the bhyve WebSocket API and sends a `change_mode/manual` command for the configured zone.
 4. The zone runs for the configured duration and status resets automatically.
 
 ---
@@ -50,6 +50,7 @@ You need your bhyve device ID before starting. Use your account credentials to q
 # Step 1 — get a session token  (field is "orbit_api_key" in the response)
 TOKEN=$(curl -s -X POST https://api.orbitbhyve.com/v1/session \
   -H "Content-Type: application/json" \
+  -H "orbit-app-id: dad3e38c-9af4-4960-aa76-9e51e8ba5c2c" \
   -d '{"session":{"email":"you@example.com","password":"yourpass"}}' \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['orbit_api_key'])")
 
@@ -92,7 +93,7 @@ Unifi Protect sends a payload like:
 }
 ```
 
-Set `TRIGGER_KEY` in `.env` to match the detection type you want to act on.
+Set `TRIGGER_KEY` in `.env` to match the detection type you want to act on (`animal`, `person`, `vehicle`, etc.).
 
 ---
 
@@ -100,16 +101,16 @@ Set `TRIGGER_KEY` in `.env` to match the detection type you want to act on.
 
 All configuration is via environment variables, set in `.env`:
 
-| Variable         | Required | Default  | Description                                                  |
-|------------------|----------|----------|--------------------------------------------------------------|
-| `BHYVE_EMAIL`    | ✅       | —        | Email address for your Orbit bhyve account                   |
-| `BHYVE_PASSWORD` | ✅       | —        | Password for your Orbit bhyve account                        |
-| `BHYVE_DEVICE_ID`| ✅       | —        | bhyve device/timer ID (see [Quick Start](#quick-start))      |
-| `ZONE_NUMBER`    |          | `1`      | Zone/station to activate (1-based, matches bhyve app)        |
-| `RUN_TIME`       |          | `5`      | How long to run the zone, in minutes                         |
-| `TRIGGER_KEY`    |          | `animal` | Unifi Protect trigger key to match (`animal`, `person`, etc.)|
-| `WEBHOOK_PORT`   |          | `8383`   | Port the HTTP server listens on                              |
-| `LOG_LEVEL`      |          | `INFO`   | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`           |
+| Variable          | Required | Default  | Description                                                  |
+|-------------------|----------|----------|--------------------------------------------------------------|
+| `BHYVE_EMAIL`     | ✅       | —        | Email address for your Orbit bhyve account                   |
+| `BHYVE_PASSWORD`  | ✅       | —        | Password for your Orbit bhyve account                        |
+| `BHYVE_DEVICE_ID` | ✅       | —        | bhyve device/timer ID (see [Quick Start](#quick-start))      |
+| `ZONE_NUMBER`     |          | `1`      | Zone/station to activate (1-based, matches bhyve app)        |
+| `RUN_TIME`        |          | `5`      | How long to run the zone, in minutes                         |
+| `TRIGGER_KEY`     |          | `animal` | Unifi Protect trigger key to match (`animal`, `person`, etc.)|
+| `WEBHOOK_PORT`    |          | `8383`   | Port the HTTP server listens on                              |
+| `LOG_LEVEL`       |          | `INFO`   | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`           |
 
 ---
 
@@ -146,10 +147,26 @@ Expected body (Unifi Protect format):
 }
 ```
 
+To activate a specific zone from the webhook (overriding `ZONE_NUMBER`), include a `zone` field at the top level:
+```json
+{
+  "zone": 2,
+  "alarm": {
+    "triggers": [
+      { "key": "animal" }
+    ]
+  }
+}
+```
+
+If `zone` is absent or invalid, the default `ZONE_NUMBER` from `.env` is used.
+
 Response:
 ```json
 { "triggered": true }
 ```
+
+> **Note:** Unifi Protect wraps its webhook body in an outer JSON string. The app automatically unwraps this double-encoding before parsing.
 
 #### `POST /test`
 
@@ -180,17 +197,18 @@ Response:
 docker compose logs -f
 
 # Example output
-2026-02-23 18:00:01 INFO     sprinkler: Starting Unifi Protect → bhyve sprinkler controller
-2026-02-23 18:00:01 INFO     sprinkler: Device: abc123 | Zone: 1 | Run time: 5 min | Trigger key: animal
-2026-02-23 18:00:02 INFO     sprinkler: bhyve login successful (user_id=456789)
-2026-02-23 18:00:02 INFO     sprinkler: Listening on port 8383
-2026-02-23 18:04:11 INFO     sprinkler: Webhook trigger matched: key=animal
-2026-02-23 18:04:11 INFO     sprinkler: Activating zone 1 for 5 minute(s)
-2026-02-23 18:04:12 INFO     sprinkler: Zone 1 is running for 5 minute(s)
-2026-02-23 18:09:12 INFO     sprinkler: Zone 1 run complete
+2026-02-26 18:00:01 INFO     sprinkler: Starting Unifi Protect → bhyve sprinkler controller
+2026-02-26 18:00:01 INFO     sprinkler: Device: abc123 | Zone: 3 | Run time: 1 min | Trigger key: animal
+2026-02-26 18:00:02 INFO     sprinkler: bhyve login successful (user_id=456789)
+2026-02-26 18:00:02 INFO     sprinkler: bhyve WebSocket connected and ready
+2026-02-26 18:00:02 INFO     sprinkler: Listening on port 8383
+2026-02-26 18:04:11 INFO     sprinkler: Webhook trigger matched: key=animal, zone=3
+2026-02-26 18:04:11 INFO     sprinkler: Activating zone 3 for 1 minute(s)
+2026-02-26 18:04:12 INFO     sprinkler: Zone 3 is running for 1 minute(s)
+2026-02-26 18:05:12 INFO     sprinkler: Zone 3 run complete
 ```
 
-Set `LOG_LEVEL=DEBUG` to see full API request/response payloads.
+Set `LOG_LEVEL=DEBUG` to see full WebSocket message payloads.
 
 ---
 
@@ -209,9 +227,10 @@ python sprinkler.py
 
 ## Architecture Notes
 
-- **Zero dependencies** — pure Python stdlib (`http.server`, `urllib`, `json`, `threading`, `signal`)
+- **Zero dependencies** — pure Python stdlib (`http.server`, `urllib`, `json`, `threading`, `signal`, `websocket` via `websocket-client` bundled in image)
 - **Thread-safe** — zone activation runs in a background thread; state protected by `threading.Lock`
-- **Token refresh** — if the bhyve session token expires, the client re-authenticates transparently on the next request
+- **WebSocket activation** — connects to the bhyve WebSocket API per activation using `orbit_session_token` for authentication; sends a `change_mode/manual` command with the target station and run time
+- **Connect-on-demand** — a fresh WebSocket connection is opened for each activation (bhyve closes idle connections after ~35 seconds)
 - **Non-blocking webhook** — the HTTP response is returned immediately; zone activation happens asynchronously
 - **Status auto-reset** — after the configured run time elapses, status returns to `idle` automatically
 
