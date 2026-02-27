@@ -613,16 +613,32 @@ class WebhookHandler(BaseHTTPRequestHandler):
     # ── webhook handler ───────────────────────────────────────────────────────
 
     def _handle_webhook(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        log.debug("Webhook raw body (%d bytes): %s", len(raw), raw[:500])
+
         try:
-            data = self._read_body()
+            data = json.loads(raw.decode()) if raw else {}
         except (json.JSONDecodeError, ValueError) as exc:
             log.warning("Bad webhook payload: %s", exc)
             self._json(400, {"error": "invalid JSON"})
             return
 
-        log.debug("Webhook received: %s", json.dumps(data))
+        # If UP wraps payload in an outer JSON string, unwrap it
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, ValueError):
+                pass
 
-        # Match trigger key in alarm.triggers[].key  (same pattern as trimlight project)
+        if not isinstance(data, dict):
+            log.warning("Webhook payload is not a JSON object: %r", data)
+            self._json(400, {"error": "expected JSON object"})
+            return
+
+        log.debug("Webhook parsed: %s", json.dumps(data))
+
+        # Match trigger key in alarm.triggers[].key
         alarm = data.get("alarm") or data.get("Alarm") or {}
         triggers = []
         if isinstance(alarm, dict):
