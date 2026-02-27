@@ -6,3 +6,5 @@ services:
       - "8383:8383"
     env_file:
       - .env
+    volumes:
+      - ./data:/data

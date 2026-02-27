@@ -101,16 +101,17 @@ Set `TRIGGER_KEY` in `.env` to match the detection type you want to act on (`ani
 
 All configuration is via environment variables, set in `.env`:
 
-| Variable          | Required | Default  | Description                                                  |
-|-------------------|----------|----------|--------------------------------------------------------------|
-| `BHYVE_EMAIL`     | ✅       | —        | Email address for your Orbit bhyve account                   |
-| `BHYVE_PASSWORD`  | ✅       | —        | Password for your Orbit bhyve account                        |
-| `BHYVE_DEVICE_ID` | ✅       | —        | bhyve device/timer ID (see [Quick Start](#quick-start))      |
-| `ZONE_NUMBER`     |          | `1`      | Zone/station to activate (1-based, matches bhyve app)        |
-| `RUN_TIME`        |          | `5`      | How long to run the zone, in minutes                         |
-| `TRIGGER_KEY`     |          | `animal` | Unifi Protect trigger key to match (`animal`, `person`, etc.)|
-| `WEBHOOK_PORT`    |          | `8383`   | Port the HTTP server listens on                              |
-| `LOG_LEVEL`       |          | `INFO`   | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`           |
+| Variable          | Required | Default                | Description                                                  |
+|-------------------|----------|------------------------|--------------------------------------------------------------|
+| `BHYVE_EMAIL`     | ✅       | —                      | Email address for your Orbit bhyve account                   |
+| `BHYVE_PASSWORD`  | ✅       | —                      | Password for your Orbit bhyve account                        |
+| `BHYVE_DEVICE_ID` | ✅       | —                      | bhyve device/timer ID (see [Quick Start](#quick-start))      |
+| `ZONE_NUMBER`     |          | `1`                    | Zone/station to activate (1-based, matches bhyve app)        |
+| `RUN_TIME`        |          | `5`                    | How long to run the zone, in minutes                         |
+| `TRIGGER_KEY`     |          | `animal`               | Unifi Protect trigger key to match (`animal`, `person`, etc.)|
+| `WEBHOOK_PORT`    |          | `8383`                 | Port the HTTP server listens on                              |
+| `LOG_LEVEL`       |          | `INFO`                 | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`           |
+| `LOG_FILE`        |          | `/data/activity.log`   | File to write activity log to (rotated at 10 MB, 3 backups). Set to empty string to disable. |
 
 ---
 
@@ -209,6 +210,19 @@ docker compose logs -f
 ```
 
 Set `LOG_LEVEL=DEBUG` to see full WebSocket message payloads.
+
+### Activity Log File
+
+All activity is also written to a persistent log file (default: `./data/activity.log` on the host, mounted into the container at `/data/activity.log`). The file is rotated automatically when it reaches 10 MB, keeping 3 backups.
+
+```bash
+# Tail the persistent log file
+tail -f data/activity.log
+```
+
+To disable file logging, set `LOG_FILE=` (empty) in `.env`.
+
+The activity log in the status page UI displays timestamps in your browser's local time zone.
 
 ---
 

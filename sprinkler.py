@@ -21,6 +21,7 @@ bhyve API reference (community-documented):
 
 import json
 import logging
+import logging.handlers
 import os
 import signal
 import sys
@@ -47,6 +48,7 @@ class Config:
         self.trigger_key      = os.environ.get("TRIGGER_KEY", "animal")
         self.webhook_port     = int(os.environ.get("WEBHOOK_PORT", "8383"))
         self.log_level        = os.environ.get("LOG_LEVEL", "INFO").upper()
+        self.log_file         = os.environ.get("LOG_FILE", "/data/activity.log")
 
         errors = []
         if not self.bhyve_email:
@@ -265,7 +267,7 @@ class SprinklerController:
         self.activity_log = []       # [(timestamp_str, message), ...]
 
     def _add_activity(self, message: str, level: str = "info"):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         with self._lock:
             self.activity_log.insert(0, (ts, level, message))
             if len(self.activity_log) > self.MAX_LOG:
@@ -393,7 +395,7 @@ _STATUS_HTML = """\
       border-bottom: 1px solid #1e293b; font-size: 0.82rem;
     }}
     .log-list li:last-child {{ border-bottom: none; }}
-    .log-ts    {{ color: #475569; white-space: nowrap; flex-shrink: 0; }}
+    time.log-ts {{ color: #475569; white-space: nowrap; flex-shrink: 0; }}
     .log-msg   {{ color: #cbd5e1; }}
     .log-error {{ color: #f87171; }}
     .log-warning {{ color: #fb923c; }}
@@ -514,6 +516,11 @@ _STATUS_HTML = """\
       }}
     }});
 
+    // Convert UTC ISO timestamps to browser local time
+    document.querySelectorAll('time.log-ts[data-utc]').forEach(el => {{
+      try {{ el.textContent = new Date(el.dataset.utc).toLocaleString(); }} catch(e) {{}}
+    }});
+
     // Auto-refresh every 15 s to reflect running status
     setTimeout(() => location.reload(), 15000);
   </script>
@@ -588,7 +595,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 ts, level, msg = entry if len(entry) == 3 else (entry[0], "info", entry[1])
                 css = "log-error" if level == "error" else ("log-warning" if level == "warning" else "log-msg")
                 rows.append(
-                    f'<li><span class="log-ts">{ts}</span>'
+                    f'<li><time class="log-ts" data-utc="{ts}">{ts}</time>'
                     f'<span class="{css}">{msg}</span></li>'
                 )
             items = "\n      ".join(rows)
@@ -718,6 +725,17 @@ def main():
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    if config.log_file:
+        os.makedirs(os.path.dirname(config.log_file), exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(
+            config.log_file, maxBytes=10 * 1024 * 1024, backupCount=3
+        )
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logging.getLogger().addHandler(fh)
 
     log.info("Starting Unifi Protect → bhyve sprinkler controller")
     log.info("Device: %s | Zone: %d | Run time: %d min | Trigger key: %s",
