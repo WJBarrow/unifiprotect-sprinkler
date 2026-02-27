@@ -652,9 +652,22 @@ class WebhookHandler(BaseHTTPRequestHandler):
         )
 
         if matched:
-            log.info("Webhook trigger matched: key=%s", self.config.trigger_key)
+            # Allow payload to override the default zone number
+            zone = None
+            raw_zone = data.get("zone") or data.get("Zone")
+            if raw_zone is not None:
+                try:
+                    zone = int(raw_zone)
+                    if not (1 <= zone <= 12):
+                        zone = None
+                except (TypeError, ValueError):
+                    zone = None
+            log.info("Webhook trigger matched: key=%s, zone=%s",
+                     self.config.trigger_key, zone or self.config.zone_number)
             threading.Thread(
-                target=self.controller.activate_zone, daemon=True
+                target=self.controller.activate_zone,
+                kwargs={"zone": zone},
+                daemon=True,
             ).start()
             self._json(200, {"triggered": True})
         else:
