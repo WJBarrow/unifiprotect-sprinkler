@@ -19,6 +19,7 @@ bhyve API reference (community-documented):
   Dep       : websocket-client (pip)
 """
 
+import html as html_lib
 import json
 import logging
 import logging.handlers
@@ -131,7 +132,9 @@ class BhyveClient:
         with self._lock:
             self._api_key       = api_key
             self._session_token = session_token
-        log.info("bhyve login successful (user_id=%s)", resp_api.get("user_id", "?"))
+        log.info("bhyve login successful")
+        # C2: user_id is a credential-adjacent identifier — DEBUG only.
+        log.debug("bhyve login successful (user_id=%s)", resp_api.get("user_id", "?"))
 
     def _request_no_appid(self, method: str, path: str, body=None):
         """REST request without orbit-app-id header — used to obtain orbit_session_token."""
@@ -253,6 +256,14 @@ class BhyveClient:
 
 # ─── Sprinkler Controller ─────────────────────────────────────────────────────
 
+def _sanitize_log(s, max_len: int = 500) -> str:
+    """M4: strip control chars from untrusted data before it hits the log file,
+    preventing forged/multi-line log entries (log injection)."""
+    if isinstance(s, bytes):
+        s = s.decode("utf-8", "replace")
+    return s[:max_len].translate({0x0A: "\\n", 0x0D: "\\r", 0x00: None, 0x1B: None})
+
+
 class SprinklerController:
     MAX_LOG = 20
 
@@ -265,6 +276,7 @@ class SprinklerController:
         self.last_run_time = None
         self.last_triggered = None
         self.activity_log = []       # [(timestamp_str, message), ...]
+        self._cooldown_until = 0.0   # monotonic deadline; blocks re-triggers (H3)
 
     def _add_activity(self, message: str, level: str = "info"):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -279,11 +291,27 @@ class SprinklerController:
         zone     = zone     if zone     is not None else self.config.zone_number
         run_time = run_time if run_time is not None else self.config.run_time
 
+        # H3: ignore re-triggers while a run is in progress (plus a 30s buffer).
+        # This caps how often any caller — webhook or /test — can drive a zone.
+        now = time.monotonic()
         with self._lock:
-            self.status        = "activating"
-            self.last_zone     = zone
-            self.last_run_time = run_time
-            self.last_triggered = datetime.now().isoformat()
+            if now < self._cooldown_until:
+                remaining = int(self._cooldown_until - now)
+                cooling = True
+            else:
+                cooling = False
+                self.status        = "activating"
+                self.last_zone     = zone
+                self.last_run_time = run_time
+                self.last_triggered = datetime.now().isoformat()
+                self._cooldown_until = now + run_time * 60 + 30
+
+        if cooling:
+            self._add_activity(
+                f"Ignored activation for zone {zone}: cooldown active ({remaining}s remaining)",
+                level="warning",
+            )
+            return False
 
         self._add_activity(f"Activating zone {zone} for {run_time} minute(s)")
 
@@ -553,6 +581,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        # M2: security headers (CSP bounds the blast radius of any HTML-injection).
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; style-src 'unsafe-inline'; "
+                         "script-src 'unsafe-inline'; connect-src 'self'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(data)
 
@@ -594,9 +628,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
             for entry in logs:
                 ts, level, msg = entry if len(entry) == 3 else (entry[0], "info", entry[1])
                 css = "log-error" if level == "error" else ("log-warning" if level == "warning" else "log-msg")
+                ts_s = html_lib.escape(str(ts))
                 rows.append(
-                    f'<li><time class="log-ts" data-utc="{ts}">{ts}</time>'
-                    f'<span class="{css}">{msg}</span></li>'
+                    f'<li><time class="log-ts" data-utc="{ts_s}">{ts_s}</time>'
+                    f'<span class="{css}">{html_lib.escape(str(msg))}</span></li>'
                 )
             items = "\n      ".join(rows)
         else:
@@ -604,13 +639,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         html = _STATUS_HTML.format(
             port=self.config.webhook_port,
-            status=status.upper(),
+            status=html_lib.escape(status.upper()),
             status_class=badge,
-            device_id=self.config.bhyve_device_id,
+            device_id=html_lib.escape(str(self.config.bhyve_device_id)),
             default_zone=self.config.zone_number,
             default_run_time=self.config.run_time,
-            trigger_key=self.config.trigger_key,
-            last_triggered=state["last_triggered"] or "Never",
+            trigger_key=html_lib.escape(str(self.config.trigger_key)),
+            last_triggered=html_lib.escape(str(state["last_triggered"] or "Never")),
             last_zone=str(state["last_zone"]) if state["last_zone"] is not None else "—",
             last_run_time=f"{state['last_run_time']} min" if state["last_run_time"] else "—",
             activity_items=items,
@@ -622,7 +657,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def _handle_webhook(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
-        log.debug("Webhook raw body (%d bytes): %s", len(raw), raw[:500])
+        log.debug("Webhook raw body (%d bytes): %s", len(raw), _sanitize_log(raw))
 
         try:
             data = json.loads(raw.decode()) if raw else {}
@@ -643,7 +678,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": "expected JSON object"})
             return
 
-        log.debug("Webhook parsed: %s", json.dumps(data))
+        log.debug("Webhook parsed: %s", _sanitize_log(json.dumps(data)))
 
         # Match trigger key in alarm.triggers[].key
         alarm = data.get("alarm") or data.get("Alarm") or {}
@@ -738,9 +773,10 @@ def main():
         logging.getLogger().addHandler(fh)
 
     log.info("Starting Unifi Protect → bhyve sprinkler controller")
-    log.info("Device: %s | Zone: %d | Run time: %d min | Trigger key: %s",
-             config.bhyve_device_id, config.zone_number,
-             config.run_time, config.trigger_key)
+    # C2: bhyve_device_id is a durable account identifier — keep it out of the
+    # world-readable activity log (it is already known from config).
+    log.info("Zone: %d | Run time: %d min | Trigger key: %s",
+             config.zone_number, config.run_time, config.trigger_key)
 
     client     = BhyveClient(config)
     controller = SprinklerController(config, client)

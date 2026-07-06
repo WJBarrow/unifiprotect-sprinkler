@@ -1,3 +1,9 @@
 .env
+# Contains a live bhyve credential; never commit (public remote).
+get-bhyve-cred.sh
 __pycache__/
 *.pyc
+
+# Security report — local-only, never commit
+SECURITY_REPORT.md
+data/
